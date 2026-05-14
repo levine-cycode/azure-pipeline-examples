@@ -1,0 +1,34 @@
+# Consumer pipeline that extends the centralized Cycode scan template.
+#
+# To adopt this pattern in a target repo:
+#   1. Copy this file to the repo root (any filename is fine).
+#   2. Update `name:` under `resources.repositories` to point at your
+#      central pipeline-templates repo.
+#   3. Register the file as a pipeline in Azure DevOps.
+
+trigger:
+  branches:
+    include:
+      - main
+
+name: $(Build.SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+variables:
+  # Pulls CYCODE_CLIENT_ID and CYCODE_CLIENT_SECRET from ADO Library.
+  - group: cycode-credentials
+
+resources:
+  repositories:
+    - repository: security-templates                                              # alias name is required; must be 'security-templates'
+      type: git
+      name: <YourProject>/<YourTemplatesRepo>
+      ref: refs/heads/main                                                        # pin to a tag in production, e.g. refs/tags/v1
+
+extends:
+  template: templates/cycode-scan.yml@security-templates
+  parameters:
+    scanTypes: [secret, sca, iac, sast]   # any combination or subset of: secret, sast, sca, iac
+    severityThreshold: "high"             # info | low | medium | high | critical
+    blockOnFindings: true                 # true = fail build on findings; false = scan and report only
+    # vmImage: "windows-2022"             # OPTIONAL — validated on windows-2022 and windows-latest
+    # scanMode: ""                        # OPTIONAL. Leave unset for diff scan on push or full scan on manual run. Force mode with "full" | "diff"

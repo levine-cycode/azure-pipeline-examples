@@ -1,0 +1,347 @@
+# Centralized Cycode scan template.
+#
+# Single source of truth for the Cycode CI/CD gate across many pipelines.
+# Consumers `extends:` this template and pass scan-type / threshold / gate
+# parameters; the template handles install, scan, reporting, and gating.
+#
+# Cross-repo usage:
+#   resources:
+#     repositories:
+#       - repository: security-templates    # alias MUST be "security-templates"
+#         type: git
+#         name: <Project>/<TemplatesRepo>
+#         ref: refs/heads/main
+#   extends:
+#     template: templates/cycode-scan.yml@security-templates
+#     parameters: { ... }
+#
+# Behavior summary:
+#   - Runs on a Microsoft-hosted windows-2022 agent (override via vmImage param).
+#   - Installs the Cycode CLI via `pip install cycode`.
+#   - Auto-detects scan mode from Build.Reason (CI/PR → diff, Manual/Schedule → full).
+#   - For diff scans, BASE is the SourceVersion of the previous successful build
+#     of this pipeline on the same branch (resolved via ADO REST). Falls back to
+#     HEAD~1 if no prior build exists.
+#   - Generates Markdown summary + HTML report + CSV + raw JSON per scan type.
+#   - Fails the build on findings at or above severityThreshold when
+#     blockOnFindings is true; otherwise scans and reports without failing.
+
+parameters:
+  - name: scanTypes
+    type: object
+    default: [secret]                 # any subset of: secret, sast, sca, iac
+                                      # Default is just 'secret' — fast, low-noise, useful signal.
+                                      # Add more types as the customer ramps up.
+
+  - name: severityThreshold
+    type: string
+    default: "high"
+    values:                           # ADO validates at compile time. Values
+      - info                          # are lowercase to match the Cycode CLI's
+      - low                           # accepted enum.
+      - medium
+      - high
+      - critical
+
+  - name: blockOnFindings
+    type: boolean
+    default: true                     # true  → build fails on findings at or above severityThreshold
+                                      # false → scan and publish reports without failing
+
+  - name: vmImage
+    type: string
+    default: "windows-2022"           # validated on windows-2022 and windows-latest
+
+  - name: scanMode
+    type: string
+    default: ""                       # OPTIONAL. Leave unset for auto-detect:
+                                      #   - IndividualCI / PullRequest / BatchedCI → diff
+                                      #   - Manual / Schedule / other               → full
+                                      # Override with "full" or "diff" to force.
+
+stages:
+  - stage: Security_Cycode
+    displayName: "Security — Cycode"
+    jobs:
+      - job: CycodeScan
+        displayName: "Cycode scan + gate"
+        # Hosted agents default to 60 min on the free/basic tier; paid tier
+        # permits up to 360 min. Set explicitly so the budget is visible and
+        # easy to raise if a long-stale branch (no prior build in months)
+        # produces a wide diff that won't finish in time. On a paid tier,
+        # 90–120 min is typical for big monorepos.
+        timeoutInMinutes: 60
+        pool:
+          vmImage: ${{ parameters.vmImage }}
+        # Multi-repo checkout layout:
+        #   $(Pipeline.Workspace)/s/_self/               — consumer's repo (self)
+        #   $(Pipeline.Workspace)/s/_security-templates/ — this template + scripts
+        # Both checkouts use explicit `path:` modifiers to prevent ADO from
+        # deduplicating them when self and security-templates point at the
+        # same git URL (same-repo demo case). Without explicit paths, ADO may
+        # short-circuit one checkout, leaving its expected directory missing.
+        # Path variables get normalized in the first bash step below so they
+        # work in Git Bash on windows-2022 (where ADO renders some path vars
+        # with backslashes that bash cannot parse).
+        variables:
+          SCRIPTS_DIR: $(Pipeline.Workspace)/s/_security-templates/scripts
+          SELF_DIR:    $(Pipeline.Workspace)/s/_self
+          OUT_DIR:     $(Build.ArtifactStagingDirectory)
+        steps:
+          # ---- Checkouts -------------------------------------------------
+          - checkout: self
+            path: s/_self                # explicit path prevents same-repo dedup
+            persistCredentials: true     # needed for $(System.AccessToken) on REST calls
+            fetchDepth: 0                # full history so diff scans can resolve any BASE
+          - checkout: security-templates
+            path: s/_security-templates
+
+          # ---- Install Cycode CLI ----------------------------------------
+          - task: UsePythonVersion@0
+            displayName: "Use Python 3.12"
+            inputs:
+              versionSpec: "3.12"
+
+          - script: pip install --quiet cycode
+            displayName: "Install Cycode CLI"
+
+          # ---- Resolve effective scan mode + BASE commit -----------------
+          - bash: |
+              set -euo pipefail
+
+              # ---- Enable long paths for Git on Windows ---------------------
+              # Java (Maven multi-module) and .NET (obj/, packages/) routinely
+              # produce paths over the legacy 260-char Windows limit. Without
+              # core.longpaths=true the Cycode CLI sees git errors or skips
+              # files silently. ADO's checkout step sets this per-repo, but
+              # we set it globally here too so any cycode-internal git
+              # invocation (e.g. commit-history) inherits it. No-op on
+              # Linux/macOS where path length isn't capped.
+              git config --global core.longpaths true || true
+
+              # ---- Normalize paths for Git Bash on windows-2022 -------------
+              # ADO renders some path variables with backslashes on Windows
+              # (e.g. D:\a\1/s/repo). bash cannot parse mixed slashes; convert
+              # all backslashes to forward slashes. No-op on Linux/macOS where
+              # the values contain none.
+              SELF="${SELF_DIR_RAW//\\//}"
+              SCRIPTS="${SCRIPTS_DIR_RAW//\\//}"
+              OUT="${OUT_DIR_RAW//\\//}"
+              echo "Normalized paths:"
+              echo "  SELF_DIR    = $SELF"
+              echo "  SCRIPTS_DIR = $SCRIPTS"
+              echo "  OUT_DIR     = $OUT"
+              echo "##vso[task.setvariable variable=SELF_DIR]$SELF"
+              echo "##vso[task.setvariable variable=SCRIPTS_DIR]$SCRIPTS"
+              echo "##vso[task.setvariable variable=OUT_DIR]$OUT"
+
+              # ---- Effective scan mode --------------------------------------
+              # Explicit parameter wins; else auto-detect from Build.Reason.
+              MODE="${{ parameters.scanMode }}"
+              REASON="$(Build.Reason)"
+              if [ -z "$MODE" ]; then
+                case "$REASON" in
+                  IndividualCI|PullRequest|BatchedCI) MODE="diff" ;;
+                  *)                                  MODE="full" ;;
+                esac
+              fi
+              echo "Build.Reason=$REASON  scanMode(param)='${{ parameters.scanMode }}'  effective=$MODE"
+              echo "##vso[task.setvariable variable=EFFECTIVE_SCAN_MODE]$MODE"
+
+              # ---- BASE commit (only when diff) -----------------------------
+              # Resolve via the previous completed build of THIS pipeline on
+              # THIS branch (pass OR fail — we just need its SourceVersion as
+              # the range start). Falls back to HEAD~1 if none.
+              BASE=""
+              if [ "$MODE" = "diff" ]; then
+                ORG_URL="$(System.TeamFoundationCollectionUri)"
+                PROJECT="$(System.TeamProject)"
+                DEF_ID="$(System.DefinitionId)"
+                BRANCH="$(Build.SourceBranch)"
+                CURRENT_ID="$(Build.BuildId)"
+
+                URL="${ORG_URL%/}/${PROJECT}/_apis/build/builds?definitions=${DEF_ID}&statusFilter=completed&queryOrder=finishTimeDescending&branchName=${BRANCH}&%24top=2&api-version=7.1"
+                echo "Querying previous completed build (any result): $URL"
+                # Capture body + HTTP status separately so a 401/403 (e.g. when
+                # the org has scoped System.AccessToken to the current project
+                # only) surfaces as a visible warning rather than silently
+                # returning empty and falling back to HEAD~1.
+                REST_BODY="$(mktemp)"
+                HTTP_CODE=$(curl -sS --max-time 30 \
+                  -o "$REST_BODY" \
+                  -w "%{http_code}" \
+                  -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
+                  -H "Accept: application/json" \
+                  "$URL" || echo "000")
+                if [ "$HTTP_CODE" = "200" ]; then
+                  BASE=$(jq -r --arg cur "$CURRENT_ID" '
+                    .value | map(select((.id|tostring) != $cur)) | .[0].sourceVersion // empty
+                  ' "$REST_BODY")
+                else
+                  echo "##[warning]Build REST call returned HTTP $HTTP_CODE (expected 200). Diff scan cannot resolve BASE from the previous build and will fall back to HEAD~1, which only covers the last commit."
+                  case "$HTTP_CODE" in
+                    401|403)
+                      echo "##[warning]Likely cause: System.AccessToken is scoped to the current project only. Fix at Organization Settings → Pipelines → Settings: disable 'Limit job authorization scope to current project for non-release pipelines'." ;;
+                    404)
+                      echo "##[warning]Likely cause: the Build REST API endpoint or API version is unrecognized. Check that the ADO instance supports api-version=7.1." ;;
+                    429)
+                      echo "##[warning]Likely cause: ADO is rate-limiting this token. Wait and re-run." ;;
+                    5*)
+                      echo "##[warning]Likely cause: a transient ADO service issue. Re-running the pipeline usually resolves it." ;;
+                    000)
+                      echo "##[warning]Likely cause: the REST call hit the 30s timeout (slow or unreachable ADO endpoint)." ;;
+                    *)
+                      echo "##[warning]Unrecognized HTTP code — inspect the response body printed below for clues." ;;
+                  esac
+                  head -c 500 "$REST_BODY" >&2
+                  BASE=""
+                fi
+                rm -f "$REST_BODY"
+
+                if [ -z "$BASE" ]; then
+                  echo "No previous successful build found on this branch; falling back to HEAD~1."
+                  cd "$SELF"
+                  BASE=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+                fi
+
+                if [ -z "$BASE" ]; then
+                  echo "##[warning]Could not resolve a BASE commit. Falling back to a full scan."
+                  echo "##vso[task.setvariable variable=EFFECTIVE_SCAN_MODE]full"
+                else
+                  echo "Resolved BASE commit: $BASE"
+                  echo "##vso[task.setvariable variable=BASE_COMMIT_RESOLVED]$BASE"
+                fi
+              fi
+            displayName: "Normalize paths + resolve scan mode + BASE commit"
+            env:
+              SELF_DIR_RAW:        $(SELF_DIR)
+              SCRIPTS_DIR_RAW:     $(SCRIPTS_DIR)
+              OUT_DIR_RAW:         $(OUT_DIR)
+              SYSTEM_ACCESSTOKEN:  $(System.AccessToken)
+
+          # ---- Per-scan-type scan + report + gate ------------------------
+          - ${{ each scanType in parameters.scanTypes }}:
+              # Scan with --soft-fail so reports always publish; gate handles fail decision.
+              # IaC always uses path scan — Cycode CLI does not support
+              # commit-history mode for IaC ("Commit range scanning for IAC
+              # is not supported"). Semantically this is also correct: IaC
+              # misconfigs apply to the current state of files regardless of
+              # when they were changed.
+              - bash: |
+                  set +e
+                  cd "$(SELF_DIR)"
+                  SCAN_TYPE="${{ scanType }}"
+                  if [ "$(EFFECTIVE_SCAN_MODE)" = "diff" ] && [ "$SCAN_TYPE" != "iac" ]; then
+                    echo "Scanning $SCAN_TYPE diff: $(BASE_COMMIT_RESOLVED)..HEAD"
+                    cycode --verbose -o json scan --soft-fail \
+                      -t "$SCAN_TYPE" \
+                      --severity-threshold ${{ parameters.severityThreshold }} \
+                      commit-history -r "$(BASE_COMMIT_RESOLVED)..HEAD" . \
+                      > "$(OUT_DIR)/cycode-$SCAN_TYPE.json"
+                  else
+                    echo "Scanning $SCAN_TYPE full tree (path mode)"
+                    cycode --verbose -o json scan --soft-fail \
+                      -t "$SCAN_TYPE" \
+                      --severity-threshold ${{ parameters.severityThreshold }} \
+                      path . \
+                      > "$(OUT_DIR)/cycode-$SCAN_TYPE.json"
+                  fi
+                  echo "scan exit: $?"
+                  ls -la "$(OUT_DIR)/cycode-$SCAN_TYPE.json"
+                displayName: "Cycode ${{ scanType }} scan"
+                condition: succeededOrFailed()
+                env:
+                  CYCODE_CLIENT_ID: $(CYCODE_CLIENT_ID)
+                  CYCODE_CLIENT_SECRET: $(CYCODE_CLIENT_SECRET)
+
+              # Reports: Markdown summary tab, HTML, CSV, raw JSON bundled per scan type.
+              # The summary file is named "Cycode <Type> Summary.md" so ADO's
+              # auto-derived section heading on the Build Summary tab reads
+              # cleanly. --no-title suppresses the redundant inline H2.
+              - bash: |
+                  set -e
+                  case "${{ scanType }}" in
+                    secret) DT="Secret" ;;
+                    sast)   DT="SAST" ;;
+                    sca)    DT="SCA" ;;
+                    iac)    DT="IaC" ;;
+                    *)      DT="${{ scanType }}" ;;
+                  esac
+                  REPORT_DIR="$(OUT_DIR)/cycode-${{ scanType }}-report"
+                  SUMMARY_MD="$REPORT_DIR/Cycode $DT Summary.md"
+                  mkdir -p "$REPORT_DIR"
+                  cp "$(OUT_DIR)/cycode-${{ scanType }}.json" "$REPORT_DIR/cycode-${{ scanType }}.json"
+                  python "$(SCRIPTS_DIR)/cycode-summary.py" "$(OUT_DIR)/cycode-${{ scanType }}.json" \
+                    --md            "$SUMMARY_MD" \
+                    --html          "$REPORT_DIR/cycode-${{ scanType }}-report.html" \
+                    --csv           "$REPORT_DIR/cycode-${{ scanType }}-report.csv" \
+                    --cycode-report "$(Build.Repository.Name)" \
+                    --no-title
+                  ls -la "$REPORT_DIR/"
+                  echo "##vso[task.uploadsummary]$SUMMARY_MD"
+                displayName: "Build ${{ scanType }} reports"
+                condition: succeededOrFailed()
+                env:
+                  CYCODE_CONSOLE_URL: "https://app.cycode.com"
+                  ADO_COLLECTION_URI: $(System.TeamFoundationCollectionUri)
+                  ADO_PROJECT: $(System.TeamProject)
+                  ADO_REPO: $(Build.Repository.Name)
+                  ADO_REF: $(Build.SourceBranchName)
+                  # Metadata for the Markdown summary header.
+                  CYCODE_SCAN_TYPE: ${{ scanType }}
+                  CYCODE_SCAN_MODE: $(EFFECTIVE_SCAN_MODE)
+                  CYCODE_BASE_COMMIT: $(BASE_COMMIT_RESOLVED)
+
+              - task: PublishBuildArtifacts@1
+                displayName: "Publish ${{ scanType }} report bundle"
+                condition: succeededOrFailed()
+                inputs:
+                  pathToPublish: $(OUT_DIR)/cycode-${{ scanType }}-report
+                  artifactName: cycode-${{ scanType }}-report
+
+              # Gate: count detections in the JSON we already produced. No re-scan.
+              # Fails loudly if the scan didn't produce a valid output document
+              # (empty file, missing key) so an auth / network / CLI failure
+              # upstream cannot silently bypass the gate as "0 findings".
+              # When blockOnFindings is false, the gate still runs and logs the
+              # count but exits 0 even on findings (warn-only mode).
+              - bash: |
+                  set -e
+                  JSON_FILE="$(OUT_DIR)/cycode-${{ scanType }}.json"
+                  # 1. The scan must have written something. An empty or missing
+                  #    file means the scan step did not run to completion.
+                  if [ ! -s "$JSON_FILE" ]; then
+                    echo "##vso[task.logissue type=error]Cycode ${{ scanType }} scan produced no output ($JSON_FILE is empty or missing). The scan step likely failed — review its log."
+                    exit 1
+                  fi
+                  # 2. The output must have the expected scan-result envelope.
+                  #    Either { "scan_results": [...] } or { "detections": [...] }.
+                  if ! jq -e 'has("scan_results") or has("detections")' "$JSON_FILE" >/dev/null 2>&1; then
+                    echo "##vso[task.logissue type=error]Cycode ${{ scanType }} scan output is malformed (no scan_results or detections key in $JSON_FILE). Review the scan step log."
+                    exit 1
+                  fi
+                  # 3. The output's errors array must be empty. Cycode CLI may
+                  #    write a partial document on auth/network failure with
+                  #    detections: [] and errors: [...]; without this check
+                  #    that would silently pass as "0 findings".
+                  err_count=$(jq '.errors | length // 0' "$JSON_FILE" 2>/dev/null || echo 0)
+                  if [ "$err_count" -gt 0 ]; then
+                    err_msg=$(jq -r '.errors | map(tostring) | join(" | ")' "$JSON_FILE")
+                    echo "##vso[task.logissue type=error]Cycode ${{ scanType }} scan reported $err_count error(s): $err_msg"
+                    exit 1
+                  fi
+                  count=$(jq '[(.scan_results[]?.detections[]?), (.detections[]?)] | length' "$JSON_FILE")
+                  echo "${{ scanType }} findings at or above ${{ parameters.severityThreshold }}: $count"
+                  if [ "$count" -gt 0 ]; then
+                    # ADO renders YAML booleans with title-case strings ("True"/"False"),
+                    # not lowercase. The comparison uses "True" intentionally — do not
+                    # change to "true" or the gate will never block.
+                    if [ "${{ parameters.blockOnFindings }}" = "True" ]; then
+                      echo "##vso[task.logissue type=error]Cycode ${{ scanType }} scan found $count finding(s) at or above ${{ parameters.severityThreshold }}. See cycode-${{ scanType }}-report artifact."
+                      exit 1
+                    else
+                      echo "##vso[task.logissue type=warning]Cycode ${{ scanType }} scan found $count finding(s) at or above ${{ parameters.severityThreshold }}. blockOnFindings is false; not failing the build."
+                    fi
+                  fi
+                displayName: "Gate: ${{ scanType }} findings"
+                condition: succeededOrFailed()
